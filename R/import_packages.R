@@ -3,4 +3,5 @@
 #' @import Matrix
 #' @importFrom stats as.formula coef glm vcov
 #' @importFrom utils write.table
+#' @import data.table fastglm glue
 NULL

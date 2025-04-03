@@ -39,6 +39,24 @@ assoc_poisson = function(data, idx = seq_len(nrow(data)), formula){
   c(coef(gg)['atac'], diag(vcov(gg))['atac'])
 }
 
+#' Perform poisson regression using fastglm: exprs ~ peak + covariates + intercept
+#'
+#' @param data contains expr values and associated peak and covariates for a gene.
+#' @param pred_var predictor vars
+#' @param res_var result var
+#' @param idx rows of the data to use: argument for boot function (bootstrapping)
+#'
+#' @return vector: (coefficient of the peak effect on gene, variance of peak effect on gene)
+#' @export
+assoc_poisson_fast =  function(data, pred_var, res_var, idx = seq_len(nrow(data))){
+  X = as.matrix(data[idx, pred_var, drop = FALSE])
+  model = fastglm::fastglm(X, data[idx, res_var], family = poisson())
+  # vcov_matrix <- solve(t(X) %*% diag(gg$weights) %*% X)  ## too slow and causes memory issues
+  W <- Matrix::Diagonal(x = model$weights)  # Sparse diagonal weight matrix
+  Hessian <- t(X) %*% W %*% X  # Compute Hessian
+  vcov_matrix <- solve(Hessian)  # Inverse to get variance-covariance matrix
+  c(coef(model)['atac'], diag(vcov_matrix)['atac'])
+}
 
 #' Perform negative binomial regression: exprs ~ peak + covariates
 #'
@@ -130,8 +148,8 @@ check_dimensions <- function(object){
 #' @slot SCENT.result data.frame. Initialized as empty. Becomes a table of resultant significant gene peak pairs
 #'
 #' @return SCENT object to use for further analysis
-#' @export
-CreateSCENTObj <- setClass(
+#' @exportClass SCENT
+setClass(
   Class = "SCENT",
   slots = c(
     rna = 'dgCMatrix',
@@ -158,6 +176,7 @@ CreateSCENTObj <- setClass(
 #' @export
 SCENT_algorithm <- function(object, celltype, ncores, regr = "poisson", bin = TRUE){
   res <- data.frame()
+  print("starting")
   for (n in 1:nrow(object@peak.info)){ ####c(1:nrow(chunkinfo))
     gene <- object@peak.info[n,1] #GENE is FIRST COLUMN OF PEAK.INFO
     this_peak <- object@peak.info[n,2] #PEAK is SECOND COLUMN OF PEAK.INFO
@@ -219,6 +238,8 @@ SCENT_algorithm <- function(object, celltype, ncores, regr = "poisson", bin = TR
       }
       out <- data.frame(gene=gene,peak=this_peak,beta=coefs[1],se=coefs[2],z=coefs[3],p=coefs[4],boot_basic_p=p0)
       res<-rbind(res,out)
+    } else {
+      print("sparse skip")
     }
   }
 
@@ -228,6 +249,126 @@ SCENT_algorithm <- function(object, celltype, ncores, regr = "poisson", bin = TR
 }
 
 
+
+#' SCENT Algorithm: Poisson Regression with Empirical P-values through Bootstrapping.
+#' Changes relative to the SCENT_algorithm function include: fastglm instead of glm (note need to explicitly add intercept in fastglm),
+#' R bootstrap sampling based on initial p value, not sequential.
+#' Also, use lapply instead of for loop.
+#' @param object SCENT object
+#' @param celltype character. User specified cell type defined in celltypes column of meta.data
+#' @param ncores numeric. Number of cores to use for Parallelization
+#' @param regr character. Regression type: "poisson" or "negbin" for Poisson regression and Negative Binomial regression, respectively
+#' @param bin logical. TRUE to binarize ATAC counts. FALSE to NOT binarize ATAC counts
+#' @param output_file character. name of output file. If provided, results are appended to this file as and when generated.
+#' @param samplingseq character. The sequence of R samplings. Default is what the orginial SCENT_algorithm function had. Custom has lower number of R samplings for a faster run.
+#'
+#' @return SCENT object with updated field SCENT.results
+#' @export
+SCENT_algorithm_fast <- function(object, celltype, ncores, regr = "poisson", bin = TRUE, output_file = NULL, samplingseq = "default"){
+  res <- data.frame()
+  print("starting")
+  res <- as.data.frame(do.call(rbind, lapply(1:nrow(object@peak.info), function(n){ ####c(1:nrow(chunkinfo))
+    gene <- object@peak.info[n,1] #GENE is FIRST COLUMN OF PEAK.INFO
+    this_peak <- object@peak.info[n,2] #PEAK is SECOND COLUMN OF PEAK.INFO
+    atac_target <- data.frame(cell = colnames(object@atac), atac = object@atac[this_peak,])
+
+
+    #binarize peaks:
+    if(bin){
+      if(nrow(atac_target[atac_target$atac>0,])>0){
+        atac_target[atac_target$atac>0,]$atac<-1
+      }
+    }
+
+    mrna_target <- object@rna[gene,]
+    df <- data.frame(cell=names(mrna_target),exprs=as.numeric(mrna_target))
+    df<-merge(df,atac_target,by="cell")
+    df<-merge(df,object@meta.data,by="cell")
+
+    df2 <- df[df[[object@celltypes]] == celltype,]
+    df2$intercept = 1
+
+    nonzero_m  <- length( df2$exprs[ df2$exprs > 0] ) / length( df2$exprs )
+    nonzero_a  <- length( df2$atac[ df2$atac > 0] ) / length( df2$atac )
+    if(nonzero_m > 0.05 & nonzero_a > 0.05){
+      #Run Regression Once Before Bootstrapping:
+      res_var <- "exprs"
+      pred_var <- c("atac", object@covariates, "intercept")
+
+
+      #Estimated Coefficients Obtained without Bootstrapping:
+      if(regr == "poisson"){
+        base = fastglm(as.matrix(df2[, pred_var]), df2$exprs, family = poisson())
+        coefs<-summary(base)$coefficients["atac",]
+        assoc <- assoc_poisson_fast
+      } else if (regr == "negbin"){
+        base = glm.nb(formula, data = df2)
+        coefs<-summary(base)$coefficients["atac",]
+        assoc <- assoc_negbin
+      }
+
+      ###Iterative Bootstrapping Procedure: Estimate the Beta coefficients and associate a 2-sided p-value.
+      R = 100
+      bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var, stype = 'i', parallel = "multicore", ncpus = ncores)
+      p0 = basic_p(bs$t0[1], bs$t[,1])
+      p00 = p0
+      if (samplingseq == "default"){### sequence of p val ranges and R samplings in the original function
+        if(p0<0.1){
+          R = 500
+          bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var, stype = 'i', parallel = "multicore", ncpus = ncores)
+          p0 = basic_p(bs$t0[1], bs$t[,1])
+        }
+        if(p0<0.05){
+          R = 2500
+          bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var,  stype = 'i', parallel = "multicore", ncpus = ncores)
+          p0 = basic_p(bs$t0[1], bs$t[,1])
+        }
+        if(p0<0.01){
+          R = 25000
+          bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var,  stype = 'i', parallel = "multicore", ncpus = ncores)
+          p0 = basic_p(bs$t0[1], bs$t[,1])
+        }
+        if(p0<0.001){
+          R = 50000
+          bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var, stype = 'i', parallel = "multicore", ncpus = ncores)
+          p0 = basic_p(bs$t0[1], bs$t[,1])
+        }
+      } else if (samplingseq == "custom"){
+        if(p0>=0.05 & p0<0.1){
+          R = 500
+          bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var, stype = 'i', parallel = "multicore", ncpus = ncores)
+          p0 = basic_p(bs$t0[1], bs$t[,1])
+        } else if(p0>=0.01 & p0<0.05){
+          R = 2500
+          bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var,  stype = 'i', parallel = "multicore", ncpus = ncores)
+          p0 = basic_p(bs$t0[1], bs$t[,1])
+        }
+        ## if p value becomes more significant after 500 or 2500 samplings, do more samplings.
+        if(p0>=0.001 & p0<0.01){
+          R = 5000
+          bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var,  stype = 'i', parallel = "multicore", ncpus = ncores)
+          p0 = basic_p(bs$t0[1], bs$t[,1])
+        } else if(p0<0.001){
+          R = 10000
+          bs = boot::boot(df2, assoc, R = R, pred_var=pred_var, res_var=res_var, stype = 'i', parallel = "multicore", ncpus = ncores)
+          p0 = basic_p(bs$t0[1], bs$t[,1])
+        }
+      }
+      out <- data.frame(gene=gene,peak=this_peak,beta=coefs[1],se=coefs[2],z=coefs[3],p=coefs[4],p_100_boots=p00,R=R,boot_basic_p=p0)
+    } else {
+      out <- data.frame(gene=gene,peak=this_peak,beta=NA,se=NA,z=NA,p=NA,p_100_boots=NA,boot_basic_p=NA,R=NA)
+      print(glue("{gene} - {this_peak} sparse skip"))
+    }
+    if (!is.null(output_file)){
+      write.table(out, file = output_file, append = TRUE, col.names = !file.exists(output_file), row.names = FALSE, sep = "\t", quote=F)
+    }
+    return(out)
+  })))
+
+  #Update the SCENT.result field of the constructor in R:
+  object@SCENT.result <- res
+  return(object)
+}
 
 #' Creating Cis Gene-Peak Pair Lists to Parallelize Through
 #'
